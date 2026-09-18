@@ -15,7 +15,7 @@ class LocalDb extends ChangeNotifier {
   Future<Database> get _database async {
     return _db ??= await openDatabase(
       p.join(await getDatabasesPath(), 'planner.db'),
-      version: 2,
+      version: 3,
       onCreate: (db, _) async {
         await db.execute('''
           CREATE TABLE items (
@@ -29,6 +29,7 @@ class LocalDb extends ChangeNotifier {
             done INTEGER NOT NULL DEFAULT 0,
             color TEXT,
             remind INTEGER,
+            series TEXT,
             updated_at INTEGER NOT NULL,
             deleted INTEGER NOT NULL DEFAULT 0,
             device TEXT NOT NULL DEFAULT '',
@@ -38,6 +39,7 @@ class LocalDb extends ChangeNotifier {
       },
       onUpgrade: (db, from, _) async {
         if (from < 2) await db.execute('ALTER TABLE items ADD COLUMN remind INTEGER');
+        if (from < 3) await db.execute('ALTER TABLE items ADD COLUMN series TEXT');
       },
     );
   }
@@ -83,6 +85,42 @@ class LocalDb extends ChangeNotifier {
     await db.insert('items', item.toRow(dirty: true),
         conflictAlgorithm: ConflictAlgorithm.replace);
     notifyListeners();
+  }
+
+  /// Saves several items in one transaction (series create/edit/delete) with one notification.
+  Future<void> saveAll(List<Item> items) async {
+    final db = await _database;
+    await db.transaction((txn) async {
+      for (final it in items) {
+        it.touch();
+        await txn.insert('items', it.toRow(dirty: true), conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+    notifyListeners();
+  }
+
+  Future<Item?> get(String id) async {
+    final db = await _database;
+    final rows = await db.query('items', where: 'id = ?', whereArgs: [id]);
+    return rows.isEmpty ? null : Item.fromRow(rows.first);
+  }
+
+  /// Unfinished one-off tasks from past days move to [today] (same rule as plannerd).
+  Future<int> carryOverTasks(String today) async {
+    final db = await _database;
+    final rows = await db.query('items',
+        where: "kind = 'task' AND deleted = 0 AND done = 0 AND series IS NULL AND date < ?",
+        whereArgs: [today]);
+    if (rows.isEmpty) return 0;
+    await saveAll([for (final r in rows) Item.fromRow(r)..date = today]);
+    return rows.length;
+  }
+
+  Future<List<Item>> seriesItems(String series) async {
+    final db = await _database;
+    final rows = await db.query('items',
+        where: 'deleted = 0 AND series = ?', whereArgs: [series], orderBy: 'date');
+    return rows.map(Item.fromRow).toList();
   }
 
   Future<void> remove(Item item) async {

@@ -4,7 +4,10 @@ import 'package:flutter/widgets.dart';
 import 'package:workmanager/workmanager.dart';
 
 import 'reminders.dart';
+import 'db.dart';
+import 'models.dart';
 import 'sync.dart';
+import 'widget_bridge.dart';
 
 const _taskName = 'planner-sync';
 
@@ -15,9 +18,11 @@ void callbackDispatcher() {
     WidgetsFlutterBinding.ensureInitialized();
     DartPluginRegistrant.ensureInitialized();
     try {
+      await LocalDb.instance.carryOverTasks(dateKey(DateTime.now()));
       await SyncService.instance.load();
       await SyncService.instance.syncNow();
       await Reminders.reschedule();
+      await WidgetBridge.update();
     } catch (e) {
       debugPrint('background sync failed: $e');
     }

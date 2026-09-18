@@ -74,10 +74,59 @@ class Reminders {
         scheduledDate: tz.TZDateTime.from(fire, tz.local),
         notificationDetails: _details,
         androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-        title: it.title.isEmpty ? 'Событие' : it.title,
+        title: it.title.isEmpty && it.body.isEmpty ? 'Событие' : it.displayTitle,
         body: it.remind == 0 ? 'Сейчас, ${it.startTime}' : 'В ${it.startTime} (через ${_ago(it.remind!)})',
       );
     }
+    await _scheduleSummaries(now);
+  }
+
+  static const summaryHour = 8;
+
+  /// 08:00 summaries for the next 7 days, built from what is planned right now.
+  static Future<void> _scheduleSummaries(DateTime now) async {
+    final items = await LocalDb.instance.range(dateKey(now), dateKey(now.add(const Duration(days: 6))));
+    for (var i = 0; i < 7; i++) {
+      final day = DateTime(now.year, now.month, now.day + i);
+      final fire = DateTime(day.year, day.month, day.day, summaryHour);
+      if (!fire.isAfter(now)) continue;
+      final key = dateKey(day);
+      final events = items.where((it) => it.date == key && it.kind == ItemKind.event).toList();
+      final tasks = items.where((it) => it.date == key && it.kind == ItemKind.task && !it.done).toList();
+      if (events.isEmpty && tasks.isEmpty) continue;
+      final head = [
+        if (events.isNotEmpty) '${events.length} ${_plural(events.length, 'событие', 'события', 'событий')}',
+        if (tasks.isNotEmpty) '${tasks.length} ${_plural(tasks.length, 'задача', 'задачи', 'задач')}',
+      ].join(', ');
+      final lines = [
+        for (final e in events) '${e.startTime ?? 'весь день'}  ${e.displayTitle}',
+        for (final t in tasks) '☐ ${t.displayTitle}',
+      ];
+      await _plugin.zonedSchedule(
+        id: 800000 + i,
+        scheduledDate: tz.TZDateTime.from(fire, tz.local),
+        notificationDetails: NotificationDetails(
+          android: AndroidNotificationDetails(
+            'summary',
+            'Утренняя сводка',
+            channelDescription: 'Список дел на день в 8:00',
+            icon: 'ic_notification',
+            color: const Color(0xFFFFB5A0),
+            styleInformation: BigTextStyleInformation(lines.join('\n')),
+          ),
+        ),
+        androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+        title: 'Сегодня: $head',
+        body: lines.take(3).join(' · '),
+      );
+    }
+  }
+
+  static String _plural(int n, String one, String few, String many) {
+    final m10 = n % 10, m100 = n % 100;
+    if (m10 == 1 && m100 != 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+    return many;
   }
 
   static String _ago(int minutes) {

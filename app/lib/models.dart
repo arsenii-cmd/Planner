@@ -24,6 +24,7 @@ class Item {
     this.done = false,
     this.color,
     this.remind,
+    this.series,
     int? updatedAt,
     this.deleted = false,
     this.device = kDevice,
@@ -40,9 +41,20 @@ class Item {
   bool done;
   String? color;
   int? remind; // minutes before startTime, null = no reminder
+  String? series; // shared id of a repeating event's occurrences
   int updatedAt;
   bool deleted;
   String device;
+
+  /// What lists show: the title, or the first line of the body when the title is empty.
+  String get displayTitle {
+    if (title.isNotEmpty) return title;
+    final first = body.split('\n').first.trim();
+    return first.isEmpty ? 'Без названия' : first;
+  }
+
+  /// Body text left after [displayTitle] took its first line.
+  String get displaySubtitle => title.isNotEmpty ? body : body.split('\n').skip(1).join(' ').trim();
 
   /// True when this version should win over [other] (same rule as plannerd).
   bool isNewerThan(Item other) {
@@ -66,6 +78,7 @@ class Item {
         done: j['done'] == true || j['done'] == 1,
         color: j['color'] as String?,
         remind: (j['remind'] as num?)?.toInt(),
+        series: j['series'] as String?,
         updatedAt: (j['updated_at'] as num).toInt(),
         deleted: j['deleted'] == true || j['deleted'] == 1,
         device: (j['device'] ?? '') as String,
@@ -82,6 +95,7 @@ class Item {
         'done': done,
         'color': color,
         'remind': remind,
+        'series': series,
         'updated_at': updatedAt,
         'deleted': deleted,
         'device': device,
@@ -98,11 +112,43 @@ class Item {
         'done': done ? 1 : 0,
         'color': color,
         'remind': remind,
+        'series': series,
         'updated_at': updatedAt,
         'deleted': deleted ? 1 : 0,
         'device': device,
         'dirty': dirty ? 1 : 0,
       };
 
+  Item copyWith({String? id, String? date, String? series}) => Item(
+        id: id ?? this.id,
+        kind: kind,
+        title: title,
+        body: body,
+        date: date ?? this.date,
+        startTime: startTime,
+        endTime: endTime,
+        done: done,
+        color: color,
+        remind: remind,
+        series: series ?? this.series,
+        updatedAt: updatedAt,
+        deleted: deleted,
+        device: device,
+      );
+
   factory Item.fromRow(Map<String, Object?> r) => Item.fromJson(r.cast<String, dynamic>());
+}
+
+enum RepeatUnit { week, month }
+
+/// [date] shifted by [steps] weeks or months; months clamp to the month's last day
+/// (31 Jan + 1 month = 28/29 Feb). Same rule as plannerd.
+String shiftDate(String date, RepeatUnit unit, int steps) {
+  final d = parseDateKey(date);
+  if (unit == RepeatUnit.week) {
+    return dateKey(DateTime(d.year, d.month, d.day + 7 * steps));
+  }
+  final firstOfTarget = DateTime(d.year, d.month + steps, 1);
+  final lastDay = DateTime(firstOfTarget.year, firstOfTarget.month + 1, 0).day;
+  return dateKey(DateTime(firstOfTarget.year, firstOfTarget.month, d.day > lastDay ? lastDay : d.day));
 }

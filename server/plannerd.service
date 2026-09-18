@@ -1,0 +1,11 @@
+[Unit]
+Description=Planner LAN sync server
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/plannerd serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

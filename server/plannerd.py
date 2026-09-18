@@ -8,7 +8,10 @@ plain HTTP on 127.0.0.1:<local_port> for the Serpantinum panel):
   GET  /api/items?from=YYYY-MM-DD&to=YYYY-MM-DD&kind=event,task
   GET  /api/notes
   POST /api/items          {item}     -> create or update (id optional)
+    optional "repeat": {"unit": "week"|"month", "count": N} creates a series
   POST /api/items/<id>/delete
+  POST /api/series/<series>/delete
+  POST /api/quick          {"text", "date"?} -> parse Russian free text ("завтра 18:00 занятие"), create it
   POST /api/sync           {"since": seq, "changes": [item...]}
                            -> {"seq": seq, "changes": [item...]}
 Requests from loopback need no token; everything else needs
@@ -36,6 +39,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))  # quickparse.py next to the real file
+import quickparse  # noqa: E402
+
 VERSION = 2
 DEFAULT_PORT = 47210
 DEFAULT_LOCAL_PORT = 47211
@@ -43,7 +49,7 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) /
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "planner"
 KINDS = ("event", "task", "note")
 FIELDS = ("id", "kind", "title", "body", "date", "start_time", "end_time",
-          "done", "color", "remind", "updated_at", "deleted", "device")
+          "done", "color", "remind", "series", "updated_at", "deleted", "device")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -57,6 +63,7 @@ CREATE TABLE IF NOT EXISTS items (
     done        INTEGER NOT NULL DEFAULT 0,
     color       TEXT,
     remind      INTEGER,
+    series      TEXT,
     updated_at  INTEGER NOT NULL,
     deleted     INTEGER NOT NULL DEFAULT 0,
     device      TEXT NOT NULL DEFAULT '',
@@ -66,6 +73,21 @@ CREATE INDEX IF NOT EXISTS items_date ON items(date);
 CREATE INDEX IF NOT EXISTS items_seq ON items(seq);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+
+MAX_REPEAT = {"week": 52, "month": 24}
+
+
+def shift_date(date_str, unit, steps):
+    """date + steps weeks/months; months clamp to the last day (31 Jan + 1 month = 28/29 Feb)."""
+    import calendar
+    from datetime import date, timedelta
+    d = date.fromisoformat(date_str)
+    if unit == "week":
+        return (d + timedelta(weeks=steps)).isoformat()
+    month0 = d.month - 1 + steps
+    year, month = d.year + month0 // 12, month0 % 12 + 1
+    return date(year, month, min(d.day, calendar.monthrange(year, month)[1])).isoformat()
 
 
 def now_ms():
@@ -104,9 +126,10 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(items)")}
-        if "remind" not in cols:  # v1 database
-            self.db.execute("ALTER TABLE items ADD COLUMN remind INTEGER")
-            self.db.commit()
+        for col, decl in (("remind", "INTEGER"), ("series", "TEXT")):  # older databases
+            if col not in cols:
+                self.db.execute("ALTER TABLE items ADD COLUMN %s %s" % (col, decl))
+        self.db.commit()
         self.lock = threading.Lock()
 
     def _next_seq(self):
@@ -142,6 +165,7 @@ class Store:
             "done": 1 if raw.get("done") else 0,
             "color": raw.get("color") or None,
             "remind": Store._remind(raw.get("remind")),
+            "series": str(raw["series"]) if raw.get("series") else None,
             "updated_at": int(raw.get("updated_at") or now_ms()),
             "deleted": 1 if raw.get("deleted") else 0,
             "device": str(raw.get("device") or device),
@@ -194,6 +218,42 @@ class Store:
             rows = self.db.execute(
                 "SELECT * FROM items WHERE deleted = 0 AND kind = 'note' ORDER BY updated_at DESC"
             )
+            return [self._row(r) for r in rows]
+
+    def create(self, item, repeat=None):
+        """Store a new item; repeat={"unit","count"} makes a series of count occurrences."""
+        if repeat and item["date"]:
+            unit = repeat.get("unit")
+            if unit not in MAX_REPEAT:
+                raise ValueError("repeat.unit must be week or month")
+            count = max(1, min(int(repeat.get("count") or 1), MAX_REPEAT[unit]))
+            if count > 1:
+                series = str(uuid.uuid4())
+                for i in range(count):
+                    occ = dict(item, series=series, date=shift_date(item["date"], unit, i))
+                    if i:
+                        occ["id"] = str(uuid.uuid4())
+                    self.upsert(occ)
+                return self.get(item["id"])
+        self.upsert(item)
+        return self.get(item["id"])
+
+    def carry_over_tasks(self, today):
+        """Unfinished one-off tasks from past days move to today. Returns how many moved."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM items WHERE kind = 'task' AND deleted = 0 AND done = 0 "
+                "AND series IS NULL AND date < ?", (today,)).fetchall()
+        stamp = now_ms()
+        for r in rows:
+            it = self._row(r)
+            it.update(date=today, updated_at=stamp, device="laptop")
+            self.upsert(Store.normalize(it, "laptop"))
+        return len(rows)
+
+    def series_items(self, series):
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM items WHERE series = ? AND deleted = 0", (series,))
             return [self._row(r) for r in rows]
 
     def get_meta(self, key, default=None):
@@ -260,9 +320,21 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and parts == ["api", "items"]:
                 raw = self._json_body()
                 raw["updated_at"] = now_ms()
+                repeat = raw.pop("repeat", None)
                 item = Store.normalize(raw, "laptop")
-                self.store.upsert(item)
-                return self._send(200, self.store.get(item["id"]))
+                if self.store.get(item["id"]):
+                    repeat = None  # editing an existing item never fans out
+                return self._send(200, self.store.create(item, repeat))
+            if method == "POST" and parts == ["api", "quick"]:
+                body = self._json_body()
+                return self._send(200, quick_add(self.store, str(body.get("text") or ""), body.get("date")))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "series"] and parts[3] == "delete":
+                stamp = now_ms()
+                items = self.store.series_items(parts[2])
+                for cur in items:
+                    cur.update(deleted=True, updated_at=stamp, device="laptop")
+                    self.store.upsert(Store.normalize(cur, "laptop"))
+                return self._send(200, {"deleted": len(items)})
             if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "delete":
                 cur = self.store.get(parts[2])
                 if not cur:
@@ -290,6 +362,20 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
+def quick_add(store, text, default_date=None):
+    parsed = quickparse.parse(text, default_date)
+    if not parsed["title"]:
+        raise ValueError("пустое название")
+    repeat = parsed.pop("repeat", None)
+    parsed["updated_at"] = now_ms()
+    item = store.create(Store.normalize(parsed, "laptop"), repeat)
+    return {"item": item, "summary": quickparse.describe(dict(parsed, repeat=repeat))}
+
+
+def notify(title, body="", urgency="normal"):
+    subprocess.run(["notify-send", "-a", "Planner", "-i", "x-office-calendar", "-u", urgency, title, body], check=False)
+
+
 def ensure_cert():
     """Self-signed certificate for the LAN port; phones pin its SHA-256 fingerprint."""
     cert, key = CONFIG_DIR / "cert.pem", CONFIG_DIR / "key.pem"
@@ -313,11 +399,39 @@ class Reminder(threading.Thread):
         self.store = store
         self.sent = set(json.loads(store.get_meta("reminded", "[]")))
 
+    SUMMARY_HOUR = 8
+
+    def daily(self, now):
+        """Once per day: move unfinished tasks to today, then the morning summary (until noon)."""
+        today = now.strftime("%Y-%m-%d")
+        if self.store.get_meta("carried") != today:
+            moved = self.store.carry_over_tasks(today)
+            self.store.set_meta("carried", today)
+            if moved:
+                print("carried %d task(s) to %s" % (moved, today), flush=True)
+        if self.store.get_meta("summary") == today or not (self.SUMMARY_HOUR <= now.hour < 12):
+            return
+        self.store.set_meta("summary", today)
+        items = self.store.range(today, today, ["event", "task"])
+        events = [i for i in items if i["kind"] == "event"]
+        tasks = [i for i in items if i["kind"] == "task" and not i["done"]]
+        if not events and not tasks:
+            return
+        lines = ["%s %s" % (e["start_time"] or "весь день", e["title"] or e["body"].split("\n")[0]) for e in events]
+        lines += ["☐ %s" % (t["title"] or t["body"].split("\n")[0]) for t in tasks]
+        head = []
+        if events:
+            head.append("%d %s" % (len(events), "событие" if len(events) == 1 else ("события" if len(events) < 5 else "событий")))
+        if tasks:
+            head.append("%d %s" % (len(tasks), "задача" if len(tasks) == 1 else ("задачи" if len(tasks) < 5 else "задач")))
+        notify("Сегодня: " + ", ".join(head), "\n".join(lines[:8]))
+
     def run(self):
         from datetime import datetime, timedelta
         while True:
             try:
                 now = datetime.now()
+                self.daily(now)
                 days = [(now + timedelta(days=d)).strftime("%Y-%m-%d") for d in (-1, 0, 1, 8)]
                 for it in self.store.range(days[0], days[3], ["event"]):
                     if it["remind"] is None or not it["start_time"]:
@@ -328,8 +442,7 @@ class Reminder(threading.Thread):
                     if mark in self.sent or not (fire <= now < start + timedelta(minutes=10)):
                         continue
                     body = "%s%s" % (it["start_time"], (" — " + it["body"]) if it["body"] else "")
-                    subprocess.run(["notify-send", "-a", "Planner", "-i", "x-office-calendar",
-                                    it["title"] or "Событие", body], check=False)
+                    notify(it["title"] or it["body"].split("\n")[0] or "Событие", body)
                     self.sent.add(mark)
                     self.store.set_meta("reminded", json.dumps(sorted(self.sent)[-500:]))
             except Exception as exc:
@@ -469,6 +582,32 @@ def cmd_pair(args):
     print("Вручную: адрес %s, порт %d, ключ %s" % (", ".join(addrs) or "?", cfg["port"], cfg["token"]))
 
 
+def cmd_add(args):
+    """Quick add from the command line / Win+P window, via the running service when possible."""
+    import urllib.error
+    import urllib.request
+    text = " ".join(args.text).strip()
+    if not text:
+        return 1
+    cfg = load_config()
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/api/quick" % cfg["local_port"],
+        data=json.dumps({"text": text}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            res = json.load(r)
+    except urllib.error.HTTPError as e:
+        print("Ошибка: %s" % json.load(e).get("error"), file=sys.stderr)
+        return 1
+    except OSError:
+        # Service is down: write straight to the database; it syncs once plannerd runs again.
+        res = quick_add(Store(DATA_DIR / "planner.db"), text)
+    print(res["summary"])
+    return 0
+
+
 def cmd_reset_token(args):
     path = CONFIG_DIR / "config.json"
     cfg = load_config()
@@ -485,8 +624,10 @@ def main():
     sub.add_parser("serve", help="run the server (default)")
     sub.add_parser("pair", help="show pairing QR code")
     sub.add_parser("reset-token", help="revoke all paired phones")
+    add = sub.add_parser("add", help='quick add, e.g. plannerd add "завтра 18:00 занятие"')
+    add.add_argument("text", nargs="+")
     args = p.parse_args()
-    {"pair": cmd_pair, "reset-token": cmd_reset_token}.get(args.cmd, cmd_serve)(args)
+    sys.exit({"pair": cmd_pair, "reset-token": cmd_reset_token, "add": cmd_add}.get(args.cmd, cmd_serve)(args))
 
 
 if __name__ == "__main__":

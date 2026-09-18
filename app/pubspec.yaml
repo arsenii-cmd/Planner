@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.1.0+2
+version: 1.4.0+7
 
 environment:
   sdk: ^3.13.3
@@ -50,6 +50,8 @@ dependencies:
   flutter_timezone: ^5.1.0
   workmanager: ^0.10.10
   crypto: ^3.0.7
+  animations: ^3.0.0
+  home_widget: ^0.10.0
 
 dev_dependencies:
   flutter_test:
@@ -73,6 +75,15 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  fonts:
+    - family: AdwaitaMono
+      fonts:
+        - asset: assets/fonts/AdwaitaMono-Regular.ttf
+        - asset: assets/fonts/AdwaitaMono-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/AdwaitaMono-Italic.ttf
+          style: italic
 
   # To add assets to your application, add an assets section, like this:
   # assets:

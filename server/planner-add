@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Tiny quick-add prompt shown in a floating kitty window (Hyprland: SUPER+P)."""
+import readline  # noqa: F401  (line editing, arrows, history within the prompt)
+import shutil
+import subprocess
+import sys
+import time
+
+ACCENT, DIM, RESET, BOLD = "\033[38;2;255;181;160m", "\033[38;2;160;140;135m", "\033[0m", "\033[1m"
+# readline counts the prompt's width: colour codes must sit between \001 and \002 or
+# wrapping and backspace get confused (long input used to overwrite the header).
+RL = lambda seq: "\001" + seq + "\002"
+
+cols = shutil.get_terminal_size((80, 10)).columns
+hint = "завтра 18:00 занятие · в пт купить хлеб · 18:00 2 недели курс"
+head = "  " + ACCENT + BOLD + "Planner" + RESET + "  "
+room = cols - 13  # width left after the visible part of the header
+print("\n" + head + DIM + (hint if len(hint) <= room else hint[: max(0, room - 1)] + "…") + RESET + "\n")
+
+try:
+    text = input("  " + RL(ACCENT) + "›" + RL(RESET) + " ").strip()
+except (EOFError, KeyboardInterrupt):
+    sys.exit(0)
+if not text:
+    sys.exit(0)
+
+res = subprocess.run(["plannerd", "add", text], capture_output=True, text=True)
+if res.returncode == 0:
+    summary = res.stdout.strip()
+    print("\n  " + ACCENT + "✓" + RESET + " " + summary)
+    subprocess.run(["notify-send", "-a", "Planner", "-i", "x-office-calendar", "-t", "3000", "Добавлено", summary])
+    time.sleep(0.9)
+else:
+    print("\n  ✗ " + (res.stderr.strip() or "не получилось"))
+    time.sleep(2)
