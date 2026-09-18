@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="432" height="432" viewBox="0 0 432 432">
+  <defs>
+    <linearGradient id="peach" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFD2C2"/>
+      <stop offset="1" stop-color="#FF9E84"/>
+    </linearGradient>
+  </defs>
+  <!-- calendar sheet -->
+  <rect x="120" y="138" width="192" height="170" rx="30" fill="none" stroke="url(#peach)" stroke-width="16"/>
+  <!-- header band -->
+  <path d="M120 176 V168 A30 30 0 0 1 150 138 H282 A30 30 0 0 1 312 168 V176 Z" fill="url(#peach)"/>
+  <rect x="120" y="168" width="192" height="26" fill="url(#peach)"/>
+  <!-- binder rings -->
+  <rect x="160" y="112" width="16" height="46" rx="8" fill="#FFD2C2"/>
+  <rect x="256" y="112" width="16" height="46" rx="8" fill="#FFD2C2"/>
+  <!-- check mark -->
+  <path d="M170 250 L202 280 L264 220" fill="none" stroke="url(#peach)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

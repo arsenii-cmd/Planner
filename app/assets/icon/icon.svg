@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 432 432">
+  <defs>
+    <radialGradient id="glow" cx="0.5" cy="0.45" r="0.6">
+      <stop offset="0" stop-color="#3A2420"/>
+      <stop offset="1" stop-color="#1A1110"/>
+    </radialGradient>
+  </defs>
+  <rect width="432" height="432" rx="96" fill="url(#glow)"/>
+  <g transform="translate(216 216) scale(1.25) translate(-216 -216)">
+    <image href="foreground.svg" width="432" height="432"/>
+  </g>
+</svg>

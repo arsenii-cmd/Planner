@@ -1,0 +1,4 @@
+app/build/
+app/.dart_tool/
+*.apk
+__pycache__/
