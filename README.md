@@ -93,6 +93,21 @@ the daemon again by mDNS when the laptop's address changes, syncs in the
 background, raises local notifications for events with a reminder set, and can
 put today's list on the home screen as a widget.
 
+## Headless copy (local-only)
+
+A always-on box without a desktop (say, one running a voice assistant) can keep its own
+decrypted copy of a cloud-paired Planner and serve it only to programs on that machine:
+
+```bash
+plannerd serve --local-only
+```
+
+It listens on `127.0.0.1:47211` only: no LAN port, no mDNS, no desktop notifications (the
+daily carry-over of unfinished tasks still runs). Give it the desktop's `cloud` section
+(`url`, `token`, `key`) with `"seq": 0`, `"enabled": true` and its own `"device"`
+(e.g. `"homebox"`), so its changes are signed with its name rather than `desktop`.
+`GET /api/items?q=text` finds items by title or text, case-insensitively.
+
 ## Quick-add syntax
 
 `quickparse.py` turns one line of Russian into an item. A time makes it an

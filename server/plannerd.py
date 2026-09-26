@@ -5,7 +5,7 @@ Storage: SQLite (~/.local/share/planner/planner.db)
 API (JSON; HTTPS with a self-signed cert pinned via the pairing QR on the LAN port,
 plain HTTP on 127.0.0.1:<local_port> for the Serpantinum panel):
   GET  /api/ping                      -> {"name", "version"}
-  GET  /api/items?from=YYYY-MM-DD&to=YYYY-MM-DD&kind=event,task
+  GET  /api/items?from=YYYY-MM-DD&to=YYYY-MM-DD&kind=event,task&q=text
   GET  /api/notes
   POST /api/items          {item}     -> create or update (id optional)
     optional "repeat": {"unit": "week"|"month", "count": N} creates a series
@@ -23,6 +23,12 @@ reverse proxy: plain HTTP on that one address only, the token is required from e
 client (loopback included, since the proxy connects from there), no mDNS, no desktop
 notifications, no carry-over (see below). `plannerd pair --url ...` run there just
 prints the address + token for a human to copy - it never sees an encryption key.
+
+Local-only mode (`plannerd serve --local-only`) is for a headless box that keeps its own
+decrypted copy through CloudSync and serves it to programs on that same machine (e.g. a
+voice assistant): only http 127.0.0.1:<local_port>, no LAN port, no mDNS, no desktop
+notifications (the daily task carry-over still runs). Name it with "cloud.device" in the
+config so its changes are told apart from the desktop's.
 
 End-to-end encryption for the cloud: the desktop generates and keeps an AES-256 key that
 the server never sees (`plannerd cloud-pair --url <address> --token <from the server>`,
@@ -266,7 +272,7 @@ class Store:
             row = self.db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         return self._row(row) if row else None
 
-    def range(self, date_from, date_to, kinds):
+    def range(self, date_from, date_to, kinds, text=None):
         q = "SELECT * FROM items WHERE deleted = 0 AND date >= ? AND date <= ?"
         args = [date_from, date_to]
         if kinds:
@@ -274,7 +280,12 @@ class Store:
             args += kinds
         q += " ORDER BY date, COALESCE(start_time, '99:99'), updated_at"
         with self.lock:
-            return [self._row(r) for r in self.db.execute(q, args)]
+            rows = [self._row(r) for r in self.db.execute(q, args)]
+        if text:
+            # in Python: SQLite's LIKE/lower() ignore case only for ASCII, not Cyrillic
+            needle = text.casefold()
+            rows = [r for r in rows if needle in (r["title"] + "\n" + r["body"]).casefold()]
+        return rows
 
     def notes(self):
         with self.lock:
@@ -382,7 +393,8 @@ class Handler(BaseHTTPRequestHandler):
                 date_from = qs.get("from", ["0000-01-01"])[0]
                 date_to = qs.get("to", ["9999-12-31"])[0]
                 kinds = [k for k in qs.get("kind", [""])[0].split(",") if k]
-                return self._send(200, self.store.range(date_from, date_to, kinds))
+                text = qs.get("q", [""])[0].strip()
+                return self._send(200, self.store.range(date_from, date_to, kinds, text))
             if method == "GET" and parts == ["api", "notes"]:
                 return self._send(200, self.store.notes())
             if method == "POST" and parts == ["api", "items"]:
@@ -547,6 +559,8 @@ class CloudSync(threading.Thread):
         self.url = cloud["url"].rstrip("/")
         self.token = cloud["token"]
         self.interval = cloud.get("interval", 60)
+        # signs this machine's changes; ties in updated_at are broken by it (default: the desktop)
+        self.device = cloud.get("device") or "desktop"
         self.stop_event = threading.Event()
 
     def _post(self, path, body):
@@ -562,7 +576,7 @@ class CloudSync(threading.Thread):
     def _to_wire(self, item):
         blob = self.crypto.encrypt({f: item[f] for f in BLOB_FIELDS})
         return {"id": item["id"], "kind": item["kind"], "updated_at": item["updated_at"],
-                "deleted": item["deleted"], "device": "desktop", "blob": blob}
+                "deleted": item["deleted"], "device": self.device, "blob": blob}
 
     def _from_wire(self, w):
         payload = self.crypto.decrypt(w["blob"]) if w.get("blob") else {}
@@ -679,6 +693,8 @@ def cmd_serve(args):
     Handler.store = Store(DATA_DIR / "planner.db")
     if args.server:
         return serve_behind_proxy(args.server)
+    if args.local_only:
+        return serve_local_only(cfg)
     cert, key, fingerprint = ensure_cert()
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -710,6 +726,24 @@ def cmd_serve(args):
     finally:
         mdns.stop_event.set()
         mdns.join(timeout=3)
+
+
+def serve_local_only(cfg):
+    """Loopback only: no LAN port (nothing to pair with on the network), no mDNS, no
+    notify-send (headless). The data comes and goes through CloudSync."""
+    Handler.timeout = 20
+    httpd = ThreadingHTTPServer(("127.0.0.1", cfg["local_port"]), Handler)
+    Reminder(Handler.store, notify=False).start()
+    if cfg.get("cloud", {}).get("enabled"):
+        CloudSync(Handler.store, cfg).start()
+    else:
+        print("cloud sync is off (no \"cloud\" in the config)", file=sys.stderr, flush=True)
+    print("plannerd: local-only, http 127.0.0.1:%d" % cfg["local_port"], flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def serve_behind_proxy(addr):
@@ -834,6 +868,8 @@ def main():
     serve = sub.add_parser("serve", help="run the server (default)")
     serve.add_argument("--server", metavar="HOST:PORT",
                        help="server mode behind a TLS reverse proxy: plain HTTP here, token always required")
+    serve.add_argument("--local-only", action="store_true",
+                       help="headless copy for this machine only: http on 127.0.0.1, no LAN port, no mDNS")
     pair = sub.add_parser("pair", help="show pairing QR code")
     pair.add_argument("--url", help="public HTTPS address of a server-mode plannerd")
     cloud_pair = sub.add_parser("cloud-pair", help="pair a phone against the cloud, arm this desktop's cloud sync")
@@ -845,6 +881,7 @@ def main():
     args = p.parse_args()
     if args.cmd is None:
         args.server = None
+        args.local_only = False
     sys.exit({"pair": cmd_pair, "cloud-pair": cmd_cloud_pair, "reset-token": cmd_reset_token,
               "add": cmd_add}.get(args.cmd, cmd_serve)(args))
 
