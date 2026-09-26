@@ -95,7 +95,7 @@ put today's list on the home screen as a widget.
 
 ## Headless copy (local-only)
 
-A always-on box without a desktop (say, one running a voice assistant) can keep its own
+An always-on box without a desktop (say, one running a voice assistant) can keep its own
 decrypted copy of a cloud-paired Planner and serve it only to programs on that machine:
 
 ```bash
