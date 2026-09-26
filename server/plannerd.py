@@ -340,6 +340,10 @@ class Handler(BaseHTTPRequestHandler):
     store = None
     config = None
     trust_loopback = True  # off in server mode: the reverse proxy connects from loopback
+    # Server mode: accept only end-to-end encrypted items (with a "blob"). Anything that would
+    # store content in the clear on the server - quick add, a plain item - is refused.
+    require_blob = False
+    NEED_BLOB = "server mode stores only end-to-end encrypted items (blob); pair with a key"
 
     def log_message(self, fmt, *args):
         if os.environ.get("PLANNER_DEBUG"):
@@ -383,6 +387,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, self.store.notes())
             if method == "POST" and parts == ["api", "items"]:
                 raw = self._json_body()
+                if self.require_blob and not raw.get("blob"):
+                    return self._send(400, {"error": self.NEED_BLOB})
                 raw["updated_at"] = now_ms()
                 repeat = raw.pop("repeat", None)
                 item = Store.normalize(raw, "laptop")
@@ -390,6 +396,9 @@ class Handler(BaseHTTPRequestHandler):
                     repeat = None  # editing an existing item never fans out
                 return self._send(200, self.store.create(item, repeat))
             if method == "POST" and parts == ["api", "quick"]:
+                if self.require_blob:
+                    return self._send(400, {"error": "quick add needs the text in the clear; "
+                                                     "not available in server mode"})
                 body = self._json_body()
                 return self._send(200, quick_add(self.store, str(body.get("text") or ""), body.get("date")))
             if method == "POST" and len(parts) == 4 and parts[:2] == ["api", "series"] and parts[3] == "delete":
@@ -409,7 +418,11 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and parts == ["api", "sync"]:
                 body = self._json_body()
                 since = int(body.get("since") or 0)
-                for raw in body.get("changes") or []:
+                changes = body.get("changes") or []
+                # All or nothing: one plain item refuses the whole batch, nothing is stored.
+                if self.require_blob and any(not (isinstance(c, dict) and c.get("blob")) for c in changes):
+                    return self._send(400, {"error": self.NEED_BLOB})
+                for raw in changes:
                     self.store.upsert(Store.normalize(raw, "phone"))
                 return self._send(200, {
                     "seq": self.store.current_seq(),
@@ -705,6 +718,7 @@ def serve_behind_proxy(addr):
         print("--server expects HOST:PORT, e.g. 127.0.0.1:47212", file=sys.stderr)
         return 2
     Handler.trust_loopback = False
+    Handler.require_blob = True
     Handler.timeout = 20
     httpd = ThreadingHTTPServer((host.strip("[]"), int(port)), Handler)
     # No Reminder here: dates live only inside the encrypted blob in cloud mode, so this

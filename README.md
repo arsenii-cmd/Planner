@@ -59,8 +59,9 @@ systemctl enable --now plannerd-server
 
 The daemon then listens on `127.0.0.1:47212` over plain HTTP and requires the token
 from every client, loopback included (the proxy connects from there). No mDNS, no
-desktop notifications; the daily carry-over of unfinished tasks still runs, in the
-unit's `TZ`. Point the proxy at it, e.g. for Caddy:
+desktop notifications. It stores only end-to-end encrypted items: quick add and any
+item without an encrypted `blob` are refused with 400, so nothing lands on the server
+in the clear. Point the proxy at it, e.g. for Caddy:
 
 ```
 planner.example.com {
