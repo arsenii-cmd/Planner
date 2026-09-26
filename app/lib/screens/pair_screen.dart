@@ -11,7 +11,7 @@ class PairScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final sync = SyncService.instance;
     return Scaffold(
-      appBar: AppBar(title: const Text('Связь с ноутом')),
+      appBar: AppBar(title: const Text('Синхронизация')),
       body: ListenableBuilder(
         listenable: sync,
         builder: (context, _) {
@@ -23,7 +23,9 @@ class PairScreen extends StatelessWidget {
                 const Icon(Icons.qr_code_scanner, size: 72),
                 const SizedBox(height: 16),
                 const Text(
-                  'На ноуте выполни в терминале:\nplannerd pair\n\nи отсканируй QR-код.',
+                  'На компьютере выполни:\nplannerd pair (по локальной сети)\n'
+                  'или plannerd cloud-pair --url … --token … (через интернет)\n\n'
+                  'и отсканируй QR-код.',
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 24),
@@ -32,21 +34,33 @@ class PairScreen extends StatelessWidget {
                   label: const Text('Сканировать QR'),
                   onPressed: () => _scan(context),
                 ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () => _manualEntry(context),
+                  child: const Text('Ввести вручную'),
+                ),
               ]),
             );
           }
           final last = sync.lastSync == null
               ? 'ещё не было'
               : DateFormat('d MMM, HH:mm:ss', 'ru_RU').format(sync.lastSync!);
+          final offlineText = pair.isCloud
+              ? 'Сервер недоступен (изменения сохранятся и уйдут позже)'
+              : 'Ноут не в сети (изменения сохранятся и уйдут позже)';
           final status = switch (sync.state) {
             SyncState.syncing => 'Синхронизация…',
             SyncState.ok => 'Синхронизировано',
-            SyncState.offline => 'Ноут не в сети (изменения сохранятся и уйдут позже)',
+            SyncState.offline => offlineText,
             SyncState.error => 'Ошибка: ${sync.error}',
             _ => 'Ожидание',
           };
           return ListView(padding: const EdgeInsets.all(16), children: [
-            ListTile(leading: const Icon(Icons.laptop), title: Text(pair.name), subtitle: Text(sync.host ?? pair.hosts.join(', '))),
+            ListTile(
+              leading: Icon(pair.isCloud ? Icons.cloud_outlined : Icons.laptop),
+              title: Text(pair.name),
+              subtitle: Text(pair.isCloud ? pair.url! : (sync.host ?? pair.hosts.join(', '))),
+            ),
             ListTile(leading: const Icon(Icons.info_outline), title: Text(status)),
             ListTile(leading: const Icon(Icons.history), title: Text('Последняя синхронизация: $last')),
             const SizedBox(height: 16),
@@ -74,6 +88,41 @@ class PairScreen extends StatelessWidget {
     );
     if (info != null) await SyncService.instance.setPair(info);
   }
+
+  Future<void> _manualEntry(BuildContext context) async {
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Вставить пейлоад сопряжения'),
+        content: TextField(
+          controller: controller,
+          maxLines: 6,
+          decoration: const InputDecoration(
+            hintText: 'JSON, который печатает plannerd pair / cloud-pair',
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Отмена')),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text('Сопрячь'),
+          ),
+        ],
+      ),
+    );
+    if (result == null || result.trim().isEmpty) return;
+    final info = PairInfo.fromQr(result.trim());
+    if (info == null) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Не удалось разобрать пейлоад')),
+        );
+      }
+      return;
+    }
+    await SyncService.instance.setPair(info);
+  }
 }
 
 class _ScannerPage extends StatefulWidget {
@@ -89,7 +138,7 @@ class _ScannerPageState extends State<_ScannerPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('QR-код с ноута')),
+      appBar: AppBar(title: const Text('QR-код с компьютера')),
       body: MobileScanner(
         onDetect: (capture) {
           if (_done) return;

@@ -1,6 +1,12 @@
 import 'package:intl/intl.dart';
 import 'package:uuid/uuid.dart';
 
+import 'crypto.dart';
+
+/// Fields folded into the encrypted "blob" for cloud sync - kept in exact sync with
+/// BLOB_FIELDS in server/plannerd.py.
+const _kBlobFields = ['title', 'body', 'date', 'start_time', 'end_time', 'done', 'color', 'remind', 'series'];
+
 /// Device id sent to the laptop. Conflicts are resolved by (updatedAt, device),
 /// so it must match what the server compares against.
 const kDevice = 'phone';
@@ -100,6 +106,35 @@ class Item {
         'deleted': deleted,
         'device': device,
       };
+
+  /// Cloud-sync wire shape: with [crypto] (cloud pairing), only id/kind/updated_at/
+  /// deleted/device stay in the clear and everything else is folded into an encrypted
+  /// "blob" the server never decrypts. Without it (LAN pairing), same as [toJson].
+  Future<Map<String, dynamic>> toWire(CloudCrypto? crypto) async {
+    final json = toJson();
+    if (crypto == null) return json;
+    return {
+      'id': id,
+      'kind': kind.name,
+      'updated_at': updatedAt,
+      'deleted': deleted,
+      'device': device,
+      'blob': await crypto.encryptField({for (final f in _kBlobFields) f: json[f]}),
+    };
+  }
+
+  static Future<Item> fromWire(Map<String, dynamic> j, CloudCrypto? crypto) async {
+    if (crypto == null || j['blob'] == null) return Item.fromJson(j);
+    final payload = await crypto.decryptField(j['blob'] as String);
+    return Item.fromJson({
+      ...payload,
+      'id': j['id'],
+      'kind': j['kind'],
+      'updated_at': j['updated_at'],
+      'deleted': j['deleted'],
+      'device': j['device'],
+    });
+  }
 
   Map<String, Object?> toRow({required bool dirty}) => {
         'id': id,

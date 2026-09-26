@@ -9,26 +9,54 @@ import 'package:http/io_client.dart';
 import 'package:nsd/nsd.dart' as nsd;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'crypto.dart';
 import 'db.dart';
 import 'models.dart';
 import 'reminders.dart';
 
 class PairInfo {
-  PairInfo({required this.name, required this.hosts, required this.port, required this.token, this.fp});
+  PairInfo({
+    required this.name,
+    this.hosts = const [],
+    this.port,
+    required this.token,
+    this.fp,
+    this.url,
+    this.key,
+  });
 
   final String name;
-  final List<String> hosts;
-  final int port;
-  final String token;
 
-  /// SHA-256 of the laptop's TLS certificate (hex). Missing = paired before encryption.
+  // LAN mode (paired via `plannerd pair`, no `url`): candidate addresses + port on the
+  // home network, plus the pinned certificate fingerprint.
+  final List<String> hosts;
+  final int? port;
   final String? fp;
 
-  /// Payload of the QR code printed by `plannerd pair`.
+  final String token;
+
+  // Cloud mode (paired via `plannerd cloud-pair`): one fixed HTTPS address, CA-signed
+  // certificate (not pinned), and the AES-256 key (base64) that encrypts everything
+  // synced through it - the server itself never sees this key.
+  final String? url;
+  final String? key;
+
+  bool get isCloud => url != null;
+
+  /// Payload of the QR code printed by `plannerd pair` (LAN or --url) or `plannerd cloud-pair`.
   static PairInfo? fromQr(String raw) {
     try {
       final j = jsonDecode(raw) as Map<String, dynamic>;
       if (j['planner'] == null || j['token'] == null) return null;
+      if (j['url'] != null) {
+        return PairInfo(
+          name: (j['name'] ?? 'сервер') as String,
+          token: j['token'] as String,
+          url: j['url'] as String,
+          key: j['key'] as String?,
+        );
+      }
+      if (j['hosts'] == null || j['port'] == null) return null;
       return PairInfo(
         name: (j['name'] ?? 'laptop') as String,
         hosts: (j['hosts'] as List).cast<String>(),
@@ -41,8 +69,9 @@ class PairInfo {
     }
   }
 
-  Map<String, dynamic> toJson() =>
-      {'planner': 2, 'name': name, 'hosts': hosts, 'port': port, 'token': token, 'fp': fp};
+  Map<String, dynamic> toJson() => isCloud
+      ? {'planner': 3, 'name': name, 'url': url, 'token': token, 'key': key}
+      : {'planner': 2, 'name': name, 'hosts': hosts, 'port': port, 'token': token, 'fp': fp};
 }
 
 enum SyncState { unpaired, idle, syncing, ok, offline, error }
@@ -52,7 +81,7 @@ class SyncService extends ChangeNotifier {
   static final SyncService instance = SyncService._();
 
   PairInfo? pair;
-  String? host; // last address that answered
+  String? host; // last address that answered (LAN mode only)
   int seq = 0;
   DateTime? lastSync;
   SyncState state = SyncState.unpaired;
@@ -60,14 +89,27 @@ class SyncService extends ChangeNotifier {
 
   Timer? _timer;
   http.Client? _client;
+  CloudCrypto? _cryptoCache;
   bool _listening = false;
   Timer? _debounce;
   Future<void>? _running;
+
+  bool get isCloud => pair?.isCloud ?? false;
+
+  /// Non-null only for a cloud pairing - the key that decrypts/encrypts everything
+  /// that goes over `/api/sync`. Null for LAN mode, where nothing is encrypted here
+  /// (the wire is already TLS with a pinned certificate inside the home network).
+  CloudCrypto? get _crypto {
+    final key = pair?.key;
+    if (key == null) return null;
+    return _cryptoCache ??= CloudCrypto(base64.decode(key));
+  }
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString('pair');
     pair = raw == null ? null : PairInfo.fromQr(raw);
+    _cryptoCache = null;
     host = prefs.getString('host');
     seq = prefs.getInt('seq') ?? 0;
     final last = prefs.getInt('lastSync');
@@ -84,10 +126,11 @@ class SyncService extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('pair', jsonEncode(info.toJson()));
     await prefs.remove('host');
-    // A new laptop (or reset database) — pull everything again.
+    // A new laptop/server (or reset database) — pull everything again.
     await prefs.setInt('seq', 0);
     pair = info;
     _client = null;
+    _cryptoCache = null;
     host = null;
     seq = 0;
     state = SyncState.idle;
@@ -101,6 +144,7 @@ class SyncService extends ChangeNotifier {
     await prefs.remove('host');
     pair = null;
     _client = null;
+    _cryptoCache = null;
     host = null;
     state = SyncState.unpaired;
     notifyListeners();
@@ -128,9 +172,15 @@ class SyncService extends ChangeNotifier {
     return _running ??= _sync().whenComplete(() => _running = null);
   }
 
-  /// HTTPS client that trusts only the certificate pinned at pairing time.
+  /// HTTPS client. LAN mode trusts only the certificate pinned at pairing time (there is
+  /// no CA behind a self-signed cert); cloud mode uses ordinary CA validation against the
+  /// server's Let's Encrypt certificate and must NOT skip it.
   http.Client get _http {
-    return _client ??= IOClient(
+    if (_client != null) return _client!;
+    if (isCloud) {
+      return _client = IOClient(HttpClient()..connectionTimeout = const Duration(seconds: 10));
+    }
+    return _client = IOClient(
       HttpClient()
         ..connectionTimeout = const Duration(seconds: 3)
         ..badCertificateCallback = (cert, host, port) =>
@@ -138,7 +188,8 @@ class SyncService extends ChangeNotifier {
     );
   }
 
-  Uri _url(String h, String path) => Uri.parse('https://$h:${pair!.port}/api/$path');
+  Uri _url(String h, String path) =>
+      isCloud ? Uri.parse('${pair!.url}/api/$path') : Uri.parse('https://$h:${pair!.port}/api/$path');
 
   Map<String, String> get _headers => {
         'Authorization': 'Bearer ${pair!.token}',
@@ -177,6 +228,7 @@ class SyncService extends ChangeNotifier {
     return null;
   }
 
+  /// LAN-mode host lookup only; cloud mode has one fixed address and skips this entirely.
   Future<String?> _findHost() async {
     final candidates = <String>{?host, ...pair!.hosts};
     for (final h in candidates) {
@@ -187,7 +239,7 @@ class SyncService extends ChangeNotifier {
 
   Future<void> _sync() async {
     if (pair == null) return;
-    if (pair!.fp == null) {
+    if (!isCloud && pair!.fp == null) {
       state = SyncState.error;
       error = 'Связь теперь зашифрована — сопряги заново (plannerd pair)';
       notifyListeners();
@@ -196,14 +248,20 @@ class SyncService extends ChangeNotifier {
     state = SyncState.syncing;
     notifyListeners();
     try {
-      final h = await _findHost();
-      if (h == null) {
-        state = SyncState.offline;
-        return;
-      }
-      if (h != host) {
-        host = h;
-        (await SharedPreferences.getInstance()).setString('host', h);
+      String h;
+      if (isCloud) {
+        h = pair!.url!;
+      } else {
+        final found = await _findHost();
+        if (found == null) {
+          state = SyncState.offline;
+          return;
+        }
+        h = found;
+        if (h != host) {
+          host = h;
+          (await SharedPreferences.getInstance()).setString('host', h);
+        }
       }
 
       final dirty = await LocalDb.instance.dirty();
@@ -212,9 +270,9 @@ class SyncService extends ChangeNotifier {
       if ((body['seq'] as num).toInt() < seq) {
         body = await _post(h, 0, const []);
       }
-      final changes = (body['changes'] as List)
-          .map((e) => Item.fromJson(e as Map<String, dynamic>))
-          .toList();
+      final changes = await Future.wait(
+        (body['changes'] as List).map((e) => Item.fromWire(e as Map<String, dynamic>, _crypto)),
+      );
       await LocalDb.instance.markClean(dirty);
       // Applying remote changes notifies listeners; don't let that trigger another sync.
       LocalDb.instance.removeListener(_onLocalChange);
@@ -234,7 +292,11 @@ class SyncService extends ChangeNotifier {
       await Reminders.reschedule();
     } on _AuthError {
       state = SyncState.error;
-      error = 'Ноут не принял ключ — сопряги заново';
+      error = isCloud ? 'Сервер не принял ключ — сопряги заново' : 'Ноут не принял ключ — сопряги заново';
+    } on SocketException {
+      state = SyncState.offline;
+    } on TimeoutException {
+      state = SyncState.offline;
     } catch (e) {
       state = SyncState.error;
       error = e.toString();
@@ -244,13 +306,14 @@ class SyncService extends ChangeNotifier {
   }
 
   Future<Map<String, dynamic>> _post(String h, int since, List<Item> changes) async {
+    final wire = await Future.wait(changes.map((c) => c.toWire(_crypto)));
     final r = await _http
         .post(
           _url(h, 'sync'),
           headers: _headers,
-          body: jsonEncode({'since': since, 'changes': changes.map((c) => c.toJson()).toList()}),
+          body: jsonEncode({'since': since, 'changes': wire}),
         )
-        .timeout(const Duration(seconds: 10));
+        .timeout(Duration(seconds: isCloud ? 20 : 10));
     if (r.statusCode == 401) throw _AuthError();
     if (r.statusCode != 200) throw Exception('HTTP ${r.statusCode}: ${utf8.decode(r.bodyBytes)}');
     return jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;

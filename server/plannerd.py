@@ -21,13 +21,25 @@ Events with "remind" (minutes before start_time) also pop a desktop notification
 Server mode (`plannerd serve --server 127.0.0.1:47212`) is for a machine behind a TLS
 reverse proxy: plain HTTP on that one address only, the token is required from every
 client (loopback included, since the proxy connects from there), no mDNS, no desktop
-notifications. Phones pair with `plannerd pair --url https://planner.example.com`.
+notifications, no carry-over (see below). `plannerd pair --url ...` run there just
+prints the address + token for a human to copy - it never sees an encryption key.
+
+End-to-end encryption for the cloud: the desktop generates and keeps an AES-256 key that
+the server never sees (`plannerd cloud-pair --url <address> --token <from the server>`,
+see cmd_cloud_pair). A cloud-mode item's real content (title/body/date/time/done/...,
+see BLOB_FIELDS) travels only inside an encrypted "blob"; the server-side columns for
+those fields stay at empty defaults. Because dates are opaque to it, a server-mode
+plannerd cannot run carry-over or the morning summary - those only happen where the
+data is in the clear (the phone, and the desktop's own local plannerd via CloudSync).
+LAN-mode sync (desktop <-> phone on the home network) is unchanged and unencrypted at
+this layer - it already runs over TLS with a pinned certificate.
 
 Conflict rule: last writer wins by updated_at (ms), ties broken by device id.
 Deletes are tombstones (deleted = 1) so they sync too.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -46,15 +58,21 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))  # quickparse.py next to the real file
 import quickparse  # noqa: E402
+from cloud_crypto import CloudCrypto, new_key  # noqa: E402
 
 VERSION = 2
+CLOUD_PAIR_VERSION = 3
 DEFAULT_PORT = 47210
 DEFAULT_LOCAL_PORT = 47211
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "planner"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "planner"
 KINDS = ("event", "task", "note")
 FIELDS = ("id", "kind", "title", "body", "date", "start_time", "end_time",
-          "done", "color", "remind", "series", "updated_at", "deleted", "device")
+          "done", "color", "remind", "series", "updated_at", "deleted", "device", "blob")
+
+# Fields folded into the encrypted "blob" for cloud sync; the server (and anyone who only
+# has the cleartext columns) never sees these for a cloud-mode item.
+BLOB_FIELDS = ("title", "body", "date", "start_time", "end_time", "done", "color", "remind", "series")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -72,7 +90,9 @@ CREATE TABLE IF NOT EXISTS items (
     updated_at  INTEGER NOT NULL,
     deleted     INTEGER NOT NULL DEFAULT 0,
     device      TEXT NOT NULL DEFAULT '',
-    seq         INTEGER NOT NULL
+    blob        TEXT,
+    seq         INTEGER NOT NULL,
+    dirty       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS items_date ON items(date);
 CREATE INDEX IF NOT EXISTS items_seq ON items(seq);
@@ -119,9 +139,15 @@ def load_config():
         cfg["name"] = socket.gethostname()
         changed = True
     if changed:
-        path.write_text(json.dumps(cfg, indent=2))
-        path.chmod(0o600)
+        save_config(cfg)
     return cfg
+
+
+def save_config(cfg):
+    path = CONFIG_DIR / "config.json"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2))
+    path.chmod(0o600)
 
 
 class Store:
@@ -131,7 +157,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(items)")}
-        for col, decl in (("remind", "INTEGER"), ("series", "TEXT")):  # older databases
+        for col, decl in (("remind", "INTEGER"), ("series", "TEXT"), ("blob", "TEXT"),
+                          ("dirty", "INTEGER NOT NULL DEFAULT 0")):  # older databases
             if col not in cols:
                 self.db.execute("ALTER TABLE items ADD COLUMN %s %s" % (col, decl))
         self.db.commit()
@@ -159,23 +186,33 @@ class Store:
         kind = raw.get("kind")
         if kind not in KINDS:
             raise ValueError("kind must be one of %s" % ", ".join(KINDS))
-        item = {
+        blob = raw.get("blob")
+        # A cloud-mode item carries its semantic content (title/body/date/... - see
+        # BLOB_FIELDS) only inside the encrypted "blob"; this server never decrypts it,
+        # so the cleartext columns stay at harmless defaults for such a row.
+        if blob is not None:
+            item = {f: ("" if f in ("title", "body") else (0 if f == "done" else None)) for f in BLOB_FIELDS}
+        else:
+            item = {
+                "title": str(raw.get("title") or "")[:500],
+                "body": str(raw.get("body") or "")[:20000],
+                "date": raw.get("date") or None,
+                "start_time": raw.get("start_time") or None,
+                "end_time": raw.get("end_time") or None,
+                "done": 1 if raw.get("done") else 0,
+                "color": raw.get("color") or None,
+                "remind": Store._remind(raw.get("remind")),
+                "series": str(raw["series"]) if raw.get("series") else None,
+            }
+        item.update({
             "id": str(raw.get("id") or uuid.uuid4()),
             "kind": kind,
-            "title": str(raw.get("title") or "")[:500],
-            "body": str(raw.get("body") or "")[:20000],
-            "date": raw.get("date") or None,
-            "start_time": raw.get("start_time") or None,
-            "end_time": raw.get("end_time") or None,
-            "done": 1 if raw.get("done") else 0,
-            "color": raw.get("color") or None,
-            "remind": Store._remind(raw.get("remind")),
-            "series": str(raw["series"]) if raw.get("series") else None,
             "updated_at": int(raw.get("updated_at") or now_ms()),
             "deleted": 1 if raw.get("deleted") else 0,
             "device": str(raw.get("device") or device),
-        }
-        if kind in ("event", "task") and not item["date"] and not item["deleted"]:
+            "blob": blob,
+        })
+        if blob is None and kind in ("event", "task") and not item["date"] and not item["deleted"]:
             raise ValueError("%s needs a date" % kind)
         return item
 
@@ -185,15 +222,19 @@ class Store:
             return None
         return max(0, min(int(value), 7 * 24 * 60))
 
-    def upsert(self, item):
-        """Apply one change if it is newer. Returns True when stored."""
+    def upsert(self, item, dirty=True):
+        """Apply one change if it is newer. Returns True when stored.
+
+        dirty=False marks a row as already caught up with the cloud (used when CloudSync
+        applies a change it just pulled down, so it doesn't immediately push it back up).
+        """
         with self.lock:
             cur = self.db.execute(
                 "SELECT updated_at, device FROM items WHERE id = ?", (item["id"],)
             ).fetchone()
             if cur and (cur["updated_at"], cur["device"]) >= (item["updated_at"], item["device"]):
                 return False
-            item = dict(item, seq=self._next_seq())
+            item = dict(item, seq=self._next_seq(), dirty=1 if dirty else 0)
             cols = ", ".join(item)
             marks = ", ".join("?" for _ in item)
             self.db.execute(
@@ -202,6 +243,23 @@ class Store:
             )
             self.db.commit()
             return True
+
+    def dirty(self):
+        """Local rows not yet pushed to the cloud."""
+        with self.lock:
+            return [self._row(r) for r in self.db.execute("SELECT * FROM items WHERE dirty = 1")]
+
+    def mark_clean(self, items):
+        """Clear the dirty flag, but only for rows that weren't edited again since `items`
+        (a snapshot from dirty()) was read - avoids losing a concurrent local edit."""
+        with self.lock:
+            for it in items:
+                cur = self.db.execute(
+                    "SELECT updated_at FROM items WHERE id = ?", (it["id"],)
+                ).fetchone()
+                if cur and cur["updated_at"] == it["updated_at"]:
+                    self.db.execute("UPDATE items SET dirty = 0 WHERE id = ?", (it["id"],))
+            self.db.commit()
 
     def get(self, item_id):
         with self.lock:
@@ -462,6 +520,65 @@ class Reminder(threading.Thread):
             time.sleep(30)
 
 
+class CloudSync(threading.Thread):
+    """Background bridge between the desktop's own (plaintext) local DB and the cloud
+    plannerd: pushes locally dirty items up encrypted, pulls remote changes down and
+    decrypts them. The cloud never sees anything but opaque blobs (see cloud_crypto.py)."""
+
+    def __init__(self, store, cfg):
+        super().__init__(daemon=True)
+        self.store = store
+        self.cfg = cfg
+        cloud = cfg["cloud"]
+        self.crypto = CloudCrypto(base64.b64decode(cloud["key"]))
+        self.url = cloud["url"].rstrip("/")
+        self.token = cloud["token"]
+        self.interval = cloud.get("interval", 60)
+        self.stop_event = threading.Event()
+
+    def _post(self, path, body):
+        import urllib.request
+        req = urllib.request.Request(
+            "%s/api/%s" % (self.url, path),
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.token},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.load(r)
+
+    def _to_wire(self, item):
+        blob = self.crypto.encrypt({f: item[f] for f in BLOB_FIELDS})
+        return {"id": item["id"], "kind": item["kind"], "updated_at": item["updated_at"],
+                "deleted": item["deleted"], "device": "desktop", "blob": blob}
+
+    def _from_wire(self, w):
+        payload = self.crypto.decrypt(w["blob"]) if w.get("blob") else {}
+        return dict(payload, id=w["id"], kind=w["kind"], updated_at=w["updated_at"],
+                    deleted=w.get("deleted", False), device=w.get("device") or "cloud")
+
+    def _sync_once(self):
+        dirty = self.store.dirty()
+        wire = [self._to_wire(it) for it in dirty]
+        seq = self.cfg["cloud"].get("seq", 0)
+        resp = self._post("sync", {"since": seq, "changes": wire})
+        if dirty:
+            self.store.mark_clean(dirty)
+        for w in resp.get("changes") or []:
+            self.store.upsert(Store.normalize(self._from_wire(w), "desktop"), dirty=False)
+        new_seq = resp.get("seq")
+        if new_seq is not None and new_seq != seq:
+            self.cfg["cloud"]["seq"] = new_seq
+            save_config(self.cfg)
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                self._sync_once()
+            except Exception as exc:
+                print("cloud sync error: %s" % exc, file=sys.stderr, flush=True)
+            self.stop_event.wait(self.interval)
+
+
 def lan_addresses():
     """Private IPv4 addresses of real LAN interfaces (skips VPN tunnels and docker)."""
     import ipaddress
@@ -563,6 +680,8 @@ def cmd_serve(args):
     local = ThreadingHTTPServer(("127.0.0.1", cfg["local_port"]), Handler)
     threading.Thread(target=local.serve_forever, daemon=True).start()
     Reminder(Handler.store).start()
+    if cfg.get("cloud", {}).get("enabled"):
+        CloudSync(Handler.store, cfg).start()
     mdns = Advertiser(cfg)
     mdns.start()
     print("plannerd: https :%d (LAN), http 127.0.0.1:%d (panel), cert %s…"
@@ -584,7 +703,8 @@ def serve_behind_proxy(addr):
     Handler.trust_loopback = False
     Handler.timeout = 20
     httpd = ThreadingHTTPServer((host.strip("[]"), int(port)), Handler)
-    Reminder(Handler.store, notify=False).start()
+    # No Reminder here: dates live only inside the encrypted blob in cloud mode, so this
+    # server can't compute carry-over or a summary, and has no desktop to notify anyway.
     print("plannerd: server mode, http %s:%s (token required, behind a TLS proxy)" % (host, port), flush=True)
     try:
         httpd.serve_forever()
@@ -621,6 +741,37 @@ def cmd_pair(args):
         subprocess.run(["qrencode", "-t", "ansiutf8", "-m", "2", payload])
     print("\nОтсканируй QR в приложении Planner на телефоне.")
     print("Вручную: адрес %s, порт %d, ключ %s" % (", ".join(addrs) or "?", cfg["port"], cfg["token"]))
+
+
+def cmd_cloud_pair(args):
+    """Pair a phone against the cloud plannerd, and arm this desktop's own CloudSync.
+
+    The encryption key is generated and kept here, on the desktop - never on the server.
+    --token is whatever `plannerd pair --url ...` printed when run once on the server
+    (a manual, already-approved read of it; this command never talks to the server)."""
+    import shutil
+    import subprocess
+    cfg = load_config()
+    key_path = CONFIG_DIR / "cloud_key.json"
+    if key_path.exists():
+        key_b64 = json.loads(key_path.read_text())["key"]
+    else:
+        key_b64 = base64.b64encode(new_key()).decode()
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        key_path.write_text(json.dumps({"key": key_b64, "created": now_ms()}))
+        key_path.chmod(0o600)
+    url = args.url.rstrip("/")
+    cfg["cloud"] = {"url": url, "token": args.token, "key": key_b64,
+                     "seq": cfg.get("cloud", {}).get("seq", 0), "enabled": True}
+    save_config(cfg)
+    payload = json.dumps({"planner": CLOUD_PAIR_VERSION, "name": cfg["name"], "url": url,
+                          "token": args.token, "key": key_b64}, separators=(",", ":"))
+    if shutil.which("qrencode"):
+        subprocess.run(["qrencode", "-t", "ansiutf8", "-m", "2", payload])
+    print("\nОтсканируй QR в приложении Planner на телефоне.")
+    print("Или вставь вручную (экран сопряжения -> «Ввести вручную»):\n%s" % payload)
+    print("\nПерезапусти plannerd, чтобы включилась фоновая синхронизация этого компьютера с облаком.")
+    return 0
 
 
 def cmd_add(args):
@@ -667,13 +818,17 @@ def main():
                        help="server mode behind a TLS reverse proxy: plain HTTP here, token always required")
     pair = sub.add_parser("pair", help="show pairing QR code")
     pair.add_argument("--url", help="public HTTPS address of a server-mode plannerd")
+    cloud_pair = sub.add_parser("cloud-pair", help="pair a phone against the cloud, arm this desktop's cloud sync")
+    cloud_pair.add_argument("--url", required=True, help="public HTTPS address of the server-mode plannerd")
+    cloud_pair.add_argument("--token", required=True, help="token printed by `plannerd pair --url` on the server")
     sub.add_parser("reset-token", help="revoke all paired phones")
     add = sub.add_parser("add", help='quick add, e.g. plannerd add "завтра 18:00 занятие"')
     add.add_argument("text", nargs="+")
     args = p.parse_args()
     if args.cmd is None:
         args.server = None
-    sys.exit({"pair": cmd_pair, "reset-token": cmd_reset_token, "add": cmd_add}.get(args.cmd, cmd_serve)(args))
+    sys.exit({"pair": cmd_pair, "cloud-pair": cmd_cloud_pair, "reset-token": cmd_reset_token,
+              "add": cmd_add}.get(args.cmd, cmd_serve)(args))
 
 
 if __name__ == "__main__":
