@@ -561,6 +561,10 @@ class CloudSync(threading.Thread):
         wire = [self._to_wire(it) for it in dirty]
         seq = self.cfg["cloud"].get("seq", 0)
         resp = self._post("sync", {"since": seq, "changes": wire})
+        # Cloud database was recreated: its counter is behind ours, pull everything (the
+        # dirty items above already went out in the call just made - same rule as the app).
+        if int(resp.get("seq") or 0) < seq:
+            resp = self._post("sync", {"since": 0, "changes": []})
         if dirty:
             self.store.mark_clean(dirty)
         for w in resp.get("changes") or []:
