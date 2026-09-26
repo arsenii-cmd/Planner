@@ -46,6 +46,39 @@ The daemon listens on TCP 47210 (HTTPS, token required) for the LAN and on
 `127.0.0.1:47211` (plain HTTP, no token) for local desktop widgets. Open 47210
 if you run a firewall.
 
+## Server mode (database on a server)
+
+To keep the database on an always-on server instead of the desktop, run plannerd
+behind a TLS reverse proxy with a real certificate:
+
+```sh
+install -Dm644 server/plannerd.py server/quickparse.py -t /opt/planner/
+install -Dm644 server/plannerd-server.service /etc/systemd/system/plannerd-server.service
+systemctl enable --now plannerd-server
+```
+
+The daemon then listens on `127.0.0.1:47212` over plain HTTP and requires the token
+from every client, loopback included (the proxy connects from there). No mDNS, no
+desktop notifications; the daily carry-over of unfinished tasks still runs, in the
+unit's `TZ`. Point the proxy at it, e.g. for Caddy:
+
+```
+planner.example.com {
+    reverse_proxy /api/* 127.0.0.1:47212
+}
+```
+
+Pair a phone against the public address:
+
+```sh
+XDG_CONFIG_HOME=/var/lib/planner/config python3 /opt/planner/plannerd.py pair --url https://planner.example.com
+```
+
+The QR payload is then `{"planner":2,"name":…,"url":"https://…","token":…}` — a `url`
+instead of `hosts`/`port`/`fp`. The certificate is checked the normal way (a public CA),
+so there is nothing to pin. Moving an existing database: stop both daemons, copy
+`planner.db` to `/var/lib/planner/`, start the server, re-pair the phone.
+
 ## App
 
 ```sh

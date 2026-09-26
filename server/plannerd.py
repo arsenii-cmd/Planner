@@ -18,6 +18,11 @@ Requests from loopback need no token; everything else needs
 "Authorization: Bearer <token>".
 Events with "remind" (minutes before start_time) also pop a desktop notification.
 
+Server mode (`plannerd serve --server 127.0.0.1:47212`) is for a machine behind a TLS
+reverse proxy: plain HTTP on that one address only, the token is required from every
+client (loopback included, since the proxy connects from there), no mDNS, no desktop
+notifications. Phones pair with `plannerd pair --url https://planner.example.com`.
+
 Conflict rule: last writer wins by updated_at (ms), ties broken by device id.
 Deletes are tombstones (deleted = 1) so they sync too.
 """
@@ -276,6 +281,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "plannerd/%d" % VERSION
     store = None
     config = None
+    trust_loopback = True  # off in server mode: the reverse proxy connects from loopback
 
     def log_message(self, fmt, *args):
         if os.environ.get("PLANNER_DEBUG"):
@@ -290,7 +296,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self):
-        if self.client_address[0] in ("127.0.0.1", "::1"):
+        if self.trust_loopback and self.client_address[0] in ("127.0.0.1", "::1"):
             return True
         auth = self.headers.get("Authorization", "")
         return secrets.compare_digest(auth, "Bearer " + self.config["token"])
@@ -394,9 +400,10 @@ def ensure_cert():
 class Reminder(threading.Thread):
     """Desktop notifications for events with a reminder, checked every 30 s."""
 
-    def __init__(self, store):
+    def __init__(self, store, notify=True):
         super().__init__(daemon=True)
         self.store = store
+        self.notify = notify  # False on a headless server: only the daily task carry-over runs
         self.sent = set(json.loads(store.get_meta("reminded", "[]")))
 
     SUMMARY_HOUR = 8
@@ -409,6 +416,8 @@ class Reminder(threading.Thread):
             self.store.set_meta("carried", today)
             if moved:
                 print("carried %d task(s) to %s" % (moved, today), flush=True)
+        if not self.notify:
+            return
         if self.store.get_meta("summary") == today or not (self.SUMMARY_HOUR <= now.hour < 12):
             return
         self.store.set_meta("summary", today)
@@ -432,6 +441,9 @@ class Reminder(threading.Thread):
             try:
                 now = datetime.now()
                 self.daily(now)
+                if not self.notify:
+                    time.sleep(30)
+                    continue
                 days = [(now + timedelta(days=d)).strftime("%Y-%m-%d") for d in (-1, 0, 1, 8)]
                 for it in self.store.range(days[0], days[3], ["event"]):
                     if it["remind"] is None or not it["start_time"]:
@@ -531,6 +543,8 @@ def cmd_serve(args):
     cfg = load_config()
     Handler.config = cfg
     Handler.store = Store(DATA_DIR / "planner.db")
+    if args.server:
+        return serve_behind_proxy(args.server)
     cert, key, fingerprint = ensure_cert()
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -562,10 +576,37 @@ def cmd_serve(args):
         mdns.join(timeout=3)
 
 
+def serve_behind_proxy(addr):
+    host, _, port = addr.rpartition(":")
+    if not host or not port.isdigit():
+        print("--server expects HOST:PORT, e.g. 127.0.0.1:47212", file=sys.stderr)
+        return 2
+    Handler.trust_loopback = False
+    Handler.timeout = 20
+    httpd = ThreadingHTTPServer((host.strip("[]"), int(port)), Handler)
+    Reminder(Handler.store, notify=False).start()
+    print("plannerd: server mode, http %s:%s (token required, behind a TLS proxy)" % (host, port), flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def cmd_pair(args):
     import shutil
     import subprocess
     cfg = load_config()
+    if args.url:
+        # Server mode: the phone reaches a public HTTPS address with a CA-signed certificate,
+        # so there is nothing to pin and no LAN hosts to try.
+        payload = json.dumps({"planner": VERSION, "name": cfg["name"], "url": args.url.rstrip("/"),
+                              "token": cfg["token"]}, separators=(",", ":"))
+        if shutil.which("qrencode"):
+            subprocess.run(["qrencode", "-t", "ansiutf8", "-m", "2", payload])
+        print("\nОтсканируй QR в приложении Planner на телефоне.")
+        print("Вручную: адрес %s, ключ %s" % (args.url.rstrip("/"), cfg["token"]))
+        return 0
     addrs = lan_addresses()
     _, _, fingerprint = ensure_cert()
     payload = json.dumps({
@@ -621,12 +662,17 @@ def cmd_reset_token(args):
 def main():
     p = argparse.ArgumentParser(prog="plannerd")
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("serve", help="run the server (default)")
-    sub.add_parser("pair", help="show pairing QR code")
+    serve = sub.add_parser("serve", help="run the server (default)")
+    serve.add_argument("--server", metavar="HOST:PORT",
+                       help="server mode behind a TLS reverse proxy: plain HTTP here, token always required")
+    pair = sub.add_parser("pair", help="show pairing QR code")
+    pair.add_argument("--url", help="public HTTPS address of a server-mode plannerd")
     sub.add_parser("reset-token", help="revoke all paired phones")
     add = sub.add_parser("add", help='quick add, e.g. plannerd add "завтра 18:00 занятие"')
     add.add_argument("text", nargs="+")
     args = p.parse_args()
+    if args.cmd is None:
+        args.server = None
     sys.exit({"pair": cmd_pair, "reset-token": cmd_reset_token, "add": cmd_add}.get(args.cmd, cmd_serve)(args))
 
 

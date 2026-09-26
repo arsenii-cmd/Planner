@@ -1,0 +1,26 @@
+# Server mode: plannerd on a headless machine behind a TLS reverse proxy (Caddy, nginx…).
+# Install: plannerd.py and quickparse.py into /opt/planner/, this file into /etc/systemd/system/.
+# Data and config live in /var/lib/planner (planner.db, config/planner/config.json).
+[Unit]
+Description=Planner sync server (behind a TLS reverse proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=planner
+StateDirectoryMode=0700
+Environment=XDG_DATA_HOME=/var/lib XDG_CONFIG_HOME=/var/lib/planner/config
+# "Today" for the daily task carry-over is taken from this zone.
+Environment=TZ=Europe/Moscow
+ExecStart=/usr/bin/python3 /opt/planner/plannerd.py serve --server 127.0.0.1:47212
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
