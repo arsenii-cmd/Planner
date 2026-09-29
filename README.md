@@ -1,5 +1,7 @@
 # Planner
 
+**English** · [Русский](README.ru.md)
+
 A calendar, day tasks and quick notes that sync between a Linux desktop and an
 Android phone over the local network — no cloud account, no third-party server.
 The desktop half is a small Python daemon over SQLite; the phone half is a
@@ -17,7 +19,7 @@ pairing QR. Nothing leaves the network.
 | `server/quickparse.py` | Russian free-text parser: `завтра 18:00 занятие` → an event tomorrow at 18:00 |
 | `server/planner-add` | Quick-add prompt for a floating terminal window (bound to `SUPER+P`) |
 | `server/plannerd.service` | systemd user unit for the daemon |
-| `app/` | The Flutter app: calendar, tasks, notes, background sync, home-screen widget |
+| `app/` | The Flutter app: calendar, tasks, notes, background sync, home-screen widget ([app/README.md](app/README.md)) |
 
 ## Server
 
