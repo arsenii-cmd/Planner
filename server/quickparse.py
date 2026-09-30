@@ -4,6 +4,7 @@
     "в пятницу с 10 до 11:30 созвон"   event on the next Friday, 10:00-11:30
     "25.09 в 9 стоматолог"             event on 25 Sep at 09:00
     "18:00 2 недели занятие"           weekly series, 2 occurrences
+    "7:00 5 дней зарядка"              daily series, 5 occurrences
     "купить хлеб"                      task on the default day
     "18:00 занятие // взять тетрадь"   everything after // becomes the description
 
@@ -68,11 +69,13 @@ def parse(text, default_date=None, today=None):
                 start = _hm(m.group(1), None)
                 t = " " + _cut(t, m) + " "
 
-    # --- repeat: "2 недели", "3 месяца" ------------------------------------------
+    # --- repeat: "5 дней", "2 недели", "3 месяца" --------------------------------
     # "через 2 недели" is a date, not a repeat
-    m = re.search(r"(?:^|(?<!через)\s)(\d{1,2})\s*(недел[яиьюe]?|нед\.?|месяц(?:а|ев)?|мес\.?)(?=\s|$)", t, re.I)
+    m = re.search(r"(?:^|(?<!через)\s)(\d{1,3})\s*(дн(?:я|ей)|день|недел[яиьюe]?|нед\.?|месяц(?:а|ев)?|мес\.?)(?=\s|$)", t, re.I)
     if m and int(m.group(1)) > 1:
-        repeat = {"unit": "week" if m.group(2).lower().startswith("нед") else "month", "count": int(m.group(1))}
+        word = m.group(2).lower()
+        unit = "day" if word.startswith(("дн", "день")) else "week" if word.startswith("нед") else "month"
+        repeat = {"unit": unit, "count": int(m.group(1))}
         t = " " + _cut(t, m) + " "
 
     # --- date -----------------------------------------------------------------
@@ -150,5 +153,5 @@ def describe(item):
         parts.append("+ пояснение")
     rep = item.get("repeat")
     if rep:
-        parts.append("%d %s" % (rep["count"], "нед." if rep["unit"] == "week" else "мес."))
+        parts.append("%d %s" % (rep["count"], {"day": "дн.", "week": "нед."}.get(rep["unit"], "мес.")))
     return " · ".join(parts)

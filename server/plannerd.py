@@ -8,7 +8,7 @@ plain HTTP on 127.0.0.1:<local_port> for the Serpantinum panel):
   GET  /api/items?from=YYYY-MM-DD&to=YYYY-MM-DD&kind=event,task&q=text
   GET  /api/notes
   POST /api/items          {item}     -> create or update (id optional)
-    optional "repeat": {"unit": "week"|"month", "count": N} creates a series
+    optional "repeat": {"unit": "day"|"week"|"month", "count": N} creates a series
   POST /api/items/<id>/delete
   POST /api/series/<series>/delete
   POST /api/quick          {"text", "date"?} -> parse Russian free text ("завтра 18:00 занятие"), create it
@@ -106,14 +106,16 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
 
-MAX_REPEAT = {"week": 52, "month": 24}
+MAX_REPEAT = {"day": 366, "week": 52, "month": 24}
 
 
 def shift_date(date_str, unit, steps):
-    """date + steps weeks/months; months clamp to the last day (31 Jan + 1 month = 28/29 Feb)."""
+    """date + steps days/weeks/months; months clamp to the last day (31 Jan + 1 month = 28/29 Feb)."""
     import calendar
     from datetime import date, timedelta
     d = date.fromisoformat(date_str)
+    if unit == "day":
+        return (d + timedelta(days=steps)).isoformat()
     if unit == "week":
         return (d + timedelta(weeks=steps)).isoformat()
     month0 = d.month - 1 + steps
@@ -299,7 +301,7 @@ class Store:
         if repeat and item["date"]:
             unit = repeat.get("unit")
             if unit not in MAX_REPEAT:
-                raise ValueError("repeat.unit must be week or month")
+                raise ValueError("repeat.unit must be day, week or month")
             count = max(1, min(int(repeat.get("count") or 1), MAX_REPEAT[unit]))
             if count > 1:
                 series = str(uuid.uuid4())
